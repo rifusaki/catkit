@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "catkit"
+version = "0.1.0"
+description = "A computational astrophysics toolkit."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    {name = "rifusaki"}
+]
+license = {text = "MIT"}
+dependencies = [
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "build",
+]
