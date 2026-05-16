@@ -10,3 +10,4 @@ env/
 venv/
 
 .pypirc
+.DS_Store
