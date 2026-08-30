@@ -1,0 +1,21 @@
+name = "zotero-koofr-flatten"
+main = "zotero-koofr-flatten-worker.js"
+compatibility_date = "2026-08-01"
+
+# Run once a day at 06:00 UTC. Adjust to taste -- cron syntax is standard.
+# You can also trigger it manually anytime via the HTTP endpoint (see the
+# "Testing" section in the worker script's header comment).
+[triggers]
+crons = ["0 6 * * *"]
+
+# Non-secret config. Point these at your actual Koofr WebDAV paths --
+# check Zotero's Sync preferences pane for the exact URL you gave it.
+[vars]
+KOOFR_ZOTERO_URL = "https://app.koofr.net/dav/Koofr/zotero"
+KOOFR_FLAT_URL   = "https://app.koofr.net/dav/Koofr/zotero-flat"
+
+# Secrets (set these with `wrangler secret put <NAME>`, do not put them here):
+#   KOOFR_USER       - your Koofr WebDAV username (usually your email)
+#   KOOFR_PASS       - a Koofr WebDAV app password (Koofr account settings ->
+#                       WebDAV -> generate one; don't use your main password)
+#   TRIGGER_SECRET   - any random string, used to gate the manual HTTP trigger
