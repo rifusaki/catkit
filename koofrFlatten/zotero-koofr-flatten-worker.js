@@ -9,7 +9,7 @@
  *                       named as the base64 of the original filename
  *   <itemKey>.prop    <- small XML with mtime/hash metadata (unused here)
  *
- * This worker lists that folder, and for every .zip it hasn't already
+ * This script lists that folder, and for every .zip it hasn't already
  * processed, downloads it, unzips the single entry, base64-decodes the
  * entry name back into a real filename (e.g. "Smith 2019 - Some Paper.pdf"),
  * and PUTs the plain file into a separate flat destination folder on the
@@ -36,57 +36,39 @@
  *
  * SETUP
  * -----
- * 1. npm install -D wrangler
- * 2. npm install fflate   (pure-JS zip lib, Workers-compatible)
- * 3. Fill in wrangler.toml (see companion file) with your account details
- *    and a cron trigger, e.g. daily: "0 6 * * *"
- * 4. Set secrets (never hardcode credentials):
- *      wrangler secret put KOOFR_USER
- *      wrangler secret put KOOFR_PASS       # Koofr WebDAV app password,
- *                                            # not your main account password
- *      wrangler secret put TRIGGER_SECRET   # random string, for manual runs
- * 5. Set vars in wrangler.toml (not secret, just config):
- *      KOOFR_ZOTERO_URL = "https://app.koofr.net/dav/Koofr/zotero"
- *      KOOFR_FLAT_URL   = "https://app.koofr.net/dav/Koofr/zotero-flat"
- *    (adjust paths to match wherever your Zotero WebDAV folder actually is
- *    in your Koofr account -- check Zotero's sync preferences for the
- *    exact URL you gave it.)
- * 6. wrangler deploy
+ * 1. npm install fflate
+ * 2. Set environment variables (e.g. in a .env file, or export them):
+ *      KOOFR_USER       - your Koofr WebDAV username (usually your email)
+ *      KOOFR_PASS       - a Koofr WebDAV app password (Koofr account settings
+ *                         -> WebDAV -> generate one; don't use your main password)
+ *      KOOFR_ZOTERO_URL - e.g. "https://app.koofr.net/dav/Koofr/zotero"
+ *      KOOFR_FLAT_URL   - e.g. "https://app.koofr.net/dav/Koofr/zotero-flat"
+ * 3. Run:  node zotero-koofr-flatten-worker.js
+ * 4. To run on a schedule, add a cron entry:
+ *      0 6 * * *  KOOFR_USER=you@example.com KOOFR_PASS=... KOOFR_ZOTERO_URL=... KOOFR_FLAT_URL=... node /path/to/zotero-koofr-flatten-worker.js
  *
  * TESTING
  * -------
- * Before trusting the cron, trigger it manually and watch the logs:
- *   curl "https://<your-worker>.workers.dev/?key=<TRIGGER_SECRET>"
- *   wrangler tail
- * Start with a KOOFR_ZOTERO_URL pointed at a folder with just one or two
+ * Start with KOOFR_ZOTERO_URL pointed at a folder with just one or two
  * attachments so you can verify a single file round-trips correctly
  * before letting it loose on your whole library.
  */
 
-import { unzipSync } from 'fflate';
+const { unzipSync } = require('fflate');
 
-export default {
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(runSync(env));
-  },
+async function runSync(log = console.log) {
+  const KOOFR_USER = process.env.KOOFR_USER;
+  const KOOFR_PASS = process.env.KOOFR_PASS;
+  const KOOFR_ZOTERO_URL = process.env.KOOFR_ZOTERO_URL;
+  const KOOFR_FLAT_URL = process.env.KOOFR_FLAT_URL;
 
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    if (url.searchParams.get('key') !== env.TRIGGER_SECRET) {
-      return new Response('Forbidden', { status: 403 });
-    }
-    const log = [];
-    await runSync(env, (msg) => log.push(msg));
-    return new Response(log.join('\n') || 'No new items.\n', {
-      headers: { 'Content-Type': 'text/plain' },
-    });
-  },
-};
+  if (!KOOFR_USER || !KOOFR_PASS || !KOOFR_ZOTERO_URL || !KOOFR_FLAT_URL) {
+    throw new Error('Missing required env vars: KOOFR_USER, KOOFR_PASS, KOOFR_ZOTERO_URL, KOOFR_FLAT_URL');
+  }
 
-async function runSync(env, log = console.log) {
-  const authHeader = 'Basic ' + btoa(`${env.KOOFR_USER}:${env.KOOFR_PASS}`);
-  const sourceBase = env.KOOFR_ZOTERO_URL.replace(/\/$/, '');
-  const destBase = env.KOOFR_FLAT_URL.replace(/\/$/, '');
+  const authHeader = 'Basic ' + Buffer.from(`${KOOFR_USER}:${KOOFR_PASS}`).toString('base64');
+  const sourceBase = KOOFR_ZOTERO_URL.replace(/\/$/, '');
+  const destBase = KOOFR_FLAT_URL.replace(/\/$/, '');
 
   await ensureCollection(`${destBase}`, authHeader);
   await ensureCollection(`${destBase}/.processed`, authHeader);
@@ -162,12 +144,6 @@ async function runSync(env, log = console.log) {
 /**
  * PROPFIND the given WebDAV collection (Depth: 1) and return the file
  * names (not full paths) of its immediate children.
- *
- * This is a minimal, regex-based parser rather than a full XML parser,
- * since Workers don't ship DOMParser for XML. It looks for <D:href> or
- * <d:href> (or unprefixed <href>) tags, which is how every WebDAV server
- * reports children in a multistatus response. If Koofr's XML uses a
- * different namespace prefix, adjust the regex below.
  */
 async function listWebDavFiles(collectionUrl, authHeader) {
   const resp = await fetch(collectionUrl, {
@@ -204,8 +180,6 @@ async function exists(url, authHeader) {
 }
 
 async function ensureCollection(url, authHeader) {
-  // MKCOL on an already-existing collection returns an error on most
-  // servers -- that's fine, we just want it to exist afterward either way.
   try {
     await fetch(url, { method: 'MKCOL', headers: { Authorization: authHeader } });
   } catch {
@@ -230,7 +204,13 @@ function decodeBase64Filename(encoded) {
 }
 
 function sanitizeFilename(name) {
-  // Keep it WebDAV-path-safe: strip characters that would otherwise need
-  // their own escaping headaches, without mangling normal titles.
   return name.replace(/[\/\\]/g, '-').trim();
 }
+
+// --- entry point ---
+runSync()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error('Fatal:', err);
+    process.exit(1);
+  });
