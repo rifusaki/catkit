@@ -11,11 +11,27 @@
  *
  * This script lists that folder, and for every .zip it hasn't already
  * processed, downloads it, unzips the single entry, base64-decodes the
- * entry name back into a real filename (e.g. "Smith 2019 - Some Paper.pdf"),
- * and PUTs the plain file into a separate flat destination folder on the
- * same Koofr account. Point any ordinary WebDAV/file browser (including
- * ones that run fine on old iOS) at the destination folder and you get
- * normal, readable files -- no Zotero client, no zip-diving required.
+ * entry name back into a filename. That decoded name is whatever the file
+ * was ORIGINALLY called (e.g. "1-s2.0-S0092867420310783-main.pdf" straight
+ * off a publisher site) -- it is NOT derived from Zotero's title/author/year
+ * metadata, because that metadata was never in WebDAV storage to begin with.
+ * It lives only in Zotero's own database, synced separately via zotero.org.
+ *
+ * To get useful names, this script additionally calls the Zotero Web API
+ * (api.zotero.org) for each attachment key, walks up to its parent
+ * bibliographic item, and builds a "LastName YYYY - Title.ext" filename from
+ * real metadata. This works precisely because the API's *metadata* sync is
+ * separate from *file* sync -- it's populated regardless of whether you use
+ * WebDAV or Zotero's own storage for the actual bytes, so it's available to
+ * us even though the files themselves aren't reachable through the API.
+ * If the API lookup fails for any reason (rate limit, top-level attachment
+ * with no parent, missing API credentials, network hiccup), it falls back
+ * to the original filename rather than skipping the file.
+ *
+ * The result is PUT into a separate flat destination folder on the same
+ * Koofr account. Point any ordinary WebDAV/file browser (including ones
+ * that run fine on old iOS) at the destination folder and you get normal,
+ * readable, sensibly-named files -- no Zotero client, no zip-diving required.
  *
  * IMPORTANT CAVEATS -- read before relying on this
  * -------------------------------------------------
@@ -33,6 +49,14 @@
  *   ".processed" folder to force a full re-sync.
  * - This is one-directional (Zotero storage -> flat folder). It won't
  *   delete flat-folder files if you delete something from Zotero.
+ * - IMPORTANT if you're updating an already-running deployment: items you've
+ *   already imported are marked done under ".processed/" and will be
+ *   SKIPPED, so they will NOT be retroactively renamed just by adding the
+ *   Zotero API credentials below. To rename existing files, delete the
+ *   corresponding marker(s) under ".processed/" (or the whole folder, to
+ *   reprocess -- and re-rename -- everything) before the next run. This
+ *   will re-upload/rename but won't remove the old, oddly-named copies
+ *   already sitting in the flat folder -- clean those up by hand if wanted.
  *
  * SETUP
  * -----
@@ -43,6 +67,18 @@
  *                         -> WebDAV -> generate one; don't use your main password)
  *      KOOFR_ZOTERO_URL - e.g. "https://app.koofr.net/dav/Koofr/zotero"
  *      KOOFR_FLAT_URL   - e.g. "https://app.koofr.net/dav/Koofr/zotero-flat"
+ *      ZOTERO_API_KEY   - (optional, but wanted for real filenames)
+ *                         zotero.org/settings/keys -> create a private key,
+ *                         read-only library access is enough
+ *      ZOTERO_USER_ID   - (optional, required alongside ZOTERO_API_KEY)
+ *                         your numeric userID, shown on the same settings
+ *                         page (this is NOT your Zotero username/email)
+ *      ZOTERO_LIBRARY_PREFIX - (optional) only set this if your attachments
+ *                         live in a GROUP library instead of your personal
+ *                         one, e.g. "groups/1234567". Overrides the default
+ *                         "users/<ZOTERO_USER_ID>" prefix.
+ *    If ZOTERO_API_KEY/ZOTERO_USER_ID are left unset, the script behaves
+ *    exactly as before: files land under their original filename.
  * 3. Run:  node zotero-koofr-flatten-worker.js
  * 4. To run on a schedule, add a cron entry:
  *      0 6 * * *  KOOFR_USER=you@example.com KOOFR_PASS=... KOOFR_ZOTERO_URL=... KOOFR_FLAT_URL=... node /path/to/zotero-koofr-flatten-worker.js
@@ -61,9 +97,17 @@ async function runSync(log = console.log) {
   const KOOFR_PASS = process.env.KOOFR_PASS;
   const KOOFR_ZOTERO_URL = process.env.KOOFR_ZOTERO_URL;
   const KOOFR_FLAT_URL = process.env.KOOFR_FLAT_URL;
+  const ZOTERO_API_KEY = process.env.ZOTERO_API_KEY;
+  const ZOTERO_USER_ID = process.env.ZOTERO_USER_ID;
+  const ZOTERO_LIBRARY_PREFIX =
+    process.env.ZOTERO_LIBRARY_PREFIX ||
+    (ZOTERO_USER_ID ? `users/${ZOTERO_USER_ID}` : null);
 
   if (!KOOFR_USER || !KOOFR_PASS || !KOOFR_ZOTERO_URL || !KOOFR_FLAT_URL) {
     throw new Error('Missing required env vars: KOOFR_USER, KOOFR_PASS, KOOFR_ZOTERO_URL, KOOFR_FLAT_URL');
+  }
+  if (!ZOTERO_API_KEY || !ZOTERO_LIBRARY_PREFIX) {
+    log('(ZOTERO_API_KEY/ZOTERO_USER_ID not set -- files will keep their original filenames)');
   }
 
   const authHeader = 'Basic ' + Buffer.from(`${KOOFR_USER}:${KOOFR_PASS}`).toString('base64');
@@ -107,10 +151,17 @@ async function runSync(log = console.log) {
       }
 
       const encodedName = entryNames[0];
-      const realName = decodeBase64Filename(encodedName) || encodedName;
+      const originalName = decodeBase64Filename(encodedName) || encodedName;
       const fileBytes = unzipped[encodedName];
+      const ext = (originalName.match(/\.[a-zA-Z0-9]+$/) || [''])[0];
 
-      const destUrl = `${destBase}/${encodeURIComponent(sanitizeFilename(realName))}`;
+      let uploadName = originalName;
+      const niceTitle = await fetchNiceFilename(key, { apiKey: ZOTERO_API_KEY, libraryPrefix: ZOTERO_LIBRARY_PREFIX }, log);
+      if (niceTitle) {
+        uploadName = `${niceTitle}${ext}`;
+      }
+
+      const destUrl = `${destBase}/${encodeURIComponent(sanitizeFilename(uploadName))}`;
       const putResp = await fetch(destUrl, {
         method: 'PUT',
         headers: {
@@ -121,7 +172,7 @@ async function runSync(log = console.log) {
       });
 
       if (!putResp.ok) {
-        log(`  FAIL ${zipName} -> ${realName}: upload failed (${putResp.status})`);
+        log(`  FAIL ${zipName} -> ${uploadName}: upload failed (${putResp.status})`);
         continue;
       }
 
@@ -131,7 +182,7 @@ async function runSync(log = console.log) {
         body: key,
       });
 
-      log(`  OK   ${zipName} -> ${realName}`);
+      log(`  OK   ${zipName} -> ${uploadName}`);
       processed++;
     } catch (err) {
       log(`  ERROR ${zipName}: ${err.message}`);
@@ -185,6 +236,73 @@ async function ensureCollection(url, authHeader) {
   } catch {
     /* ignore */
   }
+}
+
+/**
+ * Look up an attachment's parent bibliographic item via the Zotero Web API
+ * and build a "LastName YYYY - Title" filename (no extension) from real
+ * metadata. Returns null on any failure -- including missing credentials --
+ * so the caller falls back to the attachment's original filename instead of
+ * losing the file.
+ *
+ * Chain: WebDAV .zip name == attachment item's own key. The attachment
+ * item's `data.parentItem` points at the actual bibliographic item (the
+ * journalArticle/book/etc. with the title and authors). Top-level
+ * attachments (rare) have no parentItem -- we just use the attachment's
+ * own title in that case.
+ */
+async function fetchNiceFilename(attachmentKey, { apiKey, libraryPrefix }, log) {
+  if (!apiKey || !libraryPrefix) return null;
+
+  const apiBase = `https://api.zotero.org/${libraryPrefix}`;
+  const headers = { 'Zotero-API-Key': apiKey };
+
+  try {
+    const attResp = await fetch(`${apiBase}/items/${attachmentKey}?format=json`, { headers });
+    if (!attResp.ok) {
+      log(`    (metadata lookup skipped: attachment ${attachmentKey} -> ${attResp.status})`);
+      return null;
+    }
+    const attJson = await attResp.json();
+    const parentKey = attJson.data?.parentItem;
+
+    let meta = attJson.data;
+    if (parentKey) {
+      const parentResp = await fetch(`${apiBase}/items/${parentKey}?format=json`, { headers });
+      if (!parentResp.ok) {
+        log(`    (metadata lookup skipped: parent ${parentKey} -> ${parentResp.status})`);
+        return null;
+      }
+      meta = (await parentResp.json()).data;
+    }
+
+    return buildCitationName(meta);
+  } catch (err) {
+    log(`    (metadata lookup error for ${attachmentKey}: ${err.message})`);
+    return null;
+  }
+}
+
+/**
+ * "LastName YYYY - Title", truncated so the total filename stays reasonable.
+ * Falls back gracefully piece by piece if creators/date/title are missing.
+ */
+function buildCitationName(meta) {
+  if (!meta) return null;
+
+  const year = (meta.date || '').match(/\d{4}/)?.[0];
+  const firstCreator = (meta.creators || [])[0];
+  const author = firstCreator
+    ? firstCreator.lastName || firstCreator.name || ''
+    : '';
+  const title = (meta.title || '').trim();
+
+  if (!author && !title) return null;
+
+  const authorYear = [author, year].filter(Boolean).join(' ');
+  const full = [authorYear, title].filter(Boolean).join(' - ');
+
+  return full.slice(0, 150).trim();
 }
 
 /**
